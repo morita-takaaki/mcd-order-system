@@ -1,0 +1,99 @@
+========== 入電文 ==========
+2026-05-13 04:53:09
+{
+  "terminalNo": "T-01",
+  "messageType": "ORDER_CONFIRM",
+  "totalAmount": 550,
+  "items": [
+    {
+      "menuName": "ハンバーガー",
+      "unitPrice": 200,
+      "quantity": 1
+    },
+    {
+      "menuName": "ポテト",
+      "unitPrice": 350,
+      "quantity": 1
+    }
+  ]
+}
+
+========== 出電文 ==========
+2026-05-13 04:53:09
+{
+  "message": "注文を受け付けました",
+  "orderNo": "0513-001",
+  "orderStatus": "オーダー受信",
+  "result": "OK",
+  "totalAmount": 550
+}
+
+========== 入電文 ==========
+2026-05-13 05:01:40
+{
+  "terminalNo": "25S99-1",
+  "messageType": "ORDER_CONFIRM",
+  "totalAmount": 750,
+  "items": [
+    {
+      "menuName": "ハンバーガー",
+      "unitPrice": 200,
+      "quantity": 2
+    },
+    {
+      "menuName": "ポテト",
+      "unitPrice": 350,
+      "quantity": 1
+    }
+  ]
+}
+
+========== 出電文 ==========
+2026-05-13 05:01:40
+{
+  "message": "注文を受け付けました",
+  "orderNo": "0513-002",
+  "orderStatus": "オーダー受信",
+  "result": "OK",
+  "totalAmount": 750
+}
+
+========== 入電文 ==========
+2026-05-13 05:01:57
+{
+  "terminalNo": "25S99-1",
+  "messageType": "ORDER_CONFIRM",
+  "totalAmount": 750,
+  "items": [
+    {
+      "menuName": "ハンバーガー",
+      "unitPrice": 200,
+      "quantity": 2
+    },
+    {
+      "menuName": "ポテト",
+      "unitPrice": 350,
+      "quantity": 1
+    }
+  ]
+}
+
+========== 出電文 ==========
+2026-05-13 05:01:57
+{
+  "message": "注文を受け付けました",
+  "orderNo": "0513-003",
+  "orderStatus": "オーダー受信",
+  "result": "OK",
+  "totalAmount": 750
+}
+
+========== DB更新内容 ==========
+2026-05-13 05:32:33
+{
+  "message": "注文状態を更新しました",
+  "orderNo": "0513-001",
+  "orderStatus": "クッキング終了",
+  "result": "OK"
+}
+
