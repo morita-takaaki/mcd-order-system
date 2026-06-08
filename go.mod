@@ -1,4 +1,4 @@
-module food-order-backend
+module morita-burger-backend
 
 go 1.25
 

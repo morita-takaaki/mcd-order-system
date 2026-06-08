@@ -3,325 +3,322 @@ package main
 import (
 	"encoding/json"
 	"net/http"
-	"strings"
 )
 
-// CORS対応ミドルウェア (OPTIONSプリフライト対応含む)
-func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+type OrderItemInput struct {
+	MenuName  string `json:"menuName"`
+	UnitPrice int    `json:"unitPrice"`
+	Quantity  int    `json:"quantity"`
+	Subtotal  int    `json:"subtotal"`
 }
 
-// JSONレスポンスの共通化ユーティリティ
-func respondWithError(w http.ResponseWriter, code int, message string) {
-	respondWithJSON(w, code, map[string]string{"result": "NG", "message": message})
+type OrderConfirmRequest struct {
+	MessageType string           `json:"messageType"`
+	TerminalNo  string           `json:"terminalNo"`
+	TotalAmount int              `json:"totalAmount"`
+	Items       []OrderItemInput `json:"items"`
 }
 
-func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
-	response, err := json.Marshal(payload)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(`{"result":"NG","message":"Internal Server Error"}`))
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	w.Write(response)
+type GenericResponse struct {
+	Result        string   `json:"result"`
+	OrderNo       string   `json:"orderNo,omitempty"`
+	OrderStatus   string   `json:"orderStatus,omitempty"`
+	TotalAmount   int      `json:"totalAmount,omitempty"`
+	Message       string   `json:"message,omitempty"`
+	CookingOrders []string `json:"cookingOrders,omitempty"`
+	ReadyOrders   []string `json:"readyOrders,omitempty"`
 }
 
-// 3.1 注文管理関連構造体
-type CreateOrderRequest struct {
-	MessageType string      `json:"messageType"`
-	TerminalNo  string      `json:"terminalNo"`
-	TotalAmount int         `json:"totalAmount"`
-	Items       []OrderItem `json:"items"`
-}
-
-// POST /api/orders : 注文電文受信
-func handleCreateOrder(w http.ResponseWriter, r *http.Request) {
-	var req CreateOrderRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		logger.Printf("[API_IN_ERR] パース失敗: %v", err)
-		respondWithError(w, http.StatusBadRequest, "Invalid JSON payload")
-		return
-	}
-	logger.Printf("[API_IN] POST /api/orders - Terminal: %s, MessageType: %s", req.TerminalNo, req.MessageType)
-
-	// フロントエンドからのリクエストタイプ対応
-	// 本来は "ORDER_CONFIRM" 必須だが、フロント送信見本が "ORDER_REQUEST" になっているため両方を許容
-	if req.MessageType != "ORDER_CONFIRM" && req.MessageType != "ORDER_REQUEST" {
-		respondWithError(w, http.StatusBadRequest, "Invalid messageType")
-		return
-	}
-	if req.TerminalNo == "" {
-		respondWithError(w, http.StatusBadRequest, "terminalNo is required")
-		return
-	}
-	if len(req.Items) < 1 || len(req.Items) > 5 {
-		respondWithError(w, http.StatusBadRequest, "items count must be between 1 and 5")
-		return
-	}
-
-	calcTotal := 0
-	menuCheckMap := make(map[string]bool)
-
-	for _, item := range req.Items {
-		if item.MenuName == "" {
-			respondWithError(w, http.StatusBadRequest, "menuName is required in items")
-			return
-		}
-		if menuCheckMap[item.MenuName] {
-			respondWithError(w, http.StatusBadRequest, "Duplicate menuName is not allowed inside a single order")
-			return
-		}
-		menuCheckMap[item.MenuName] = true
-
-		// フロントからの簡易JSON（単価なし）が飛んできた場合の、デモ・評価用の最低価格補正
-		if item.UnitPrice < 1 {
-			item.UnitPrice = 500 // 自動補正値
-		}
-		if item.Quantity < 1 || item.Quantity > 5 {
-			respondWithError(w, http.StatusBadRequest, "item quantity must be between 1 and 5")
-			return
-		}
-		calcTotal += item.UnitPrice * item.Quantity
-	}
-
-	// フロントエンドからトータル金額の送信がない、もしくは0の場合は自動的に計算値で埋める
-	if req.TotalAmount < 1 {
-		req.TotalAmount = calcTotal
-	}
-
-	if calcTotal != req.TotalAmount {
-		respondWithError(w, http.StatusBadRequest, "totalAmount does not match item subtotals")
-		return
-	}
-
-	// 同一トランザクション内での採番・登録
-	orderNo, err := insertOrderWithSequence(req.TerminalNo, req.Items)
-	if err != nil {
-		logger.Printf("[ERROR] 注文登録失敗: %v", err)
-		respondWithError(w, http.StatusInternalServerError, "Database error during placement")
-		return
-	}
-
-	resp := map[string]interface{}{
-		"result":      "OK",
-		"orderNo":     orderNo,
-		"orderStatus": StatusReceived,
-		"totalAmount": req.TotalAmount,
-		"message":     "Order received successfully",
-	}
-	logger.Printf("[API_OUT] POST /api/orders 成功 - OrderNo: %s", orderNo)
-	respondWithJSON(w, http.StatusCreated, resp)
-}
-
-// GET /api/orders & GET /api/orders?status=xxx
-func handleListOrders(w http.ResponseWriter, r *http.Request) {
-	statusFilter := r.URL.Query().Get("status")
-	logger.Printf("[API_IN] GET /api/orders - FilterStatus: %s", statusFilter)
-
-	list, err := getOrdersWithFilter(statusFilter)
-	if err != nil {
-		logger.Printf("[ERROR] 注文一覧取得失敗: %v", err)
-		respondWithError(w, http.StatusInternalServerError, "Database fetch error")
-		return
-	}
-
-	respondWithJSON(w, http.StatusOK, list)
-}
-
-// GET /api/orders/{orderNo}
-func handleGetOrder(w http.ResponseWriter, r *http.Request) {
-	orderNo := r.PathValue("orderNo")
-	logger.Printf("[API_IN] GET /api/orders/%s", orderNo)
-
-	rows, err := db.Query(`
-		SELECT id, order_no, terminal_no, order_status, item_no, menu_name, unit_price, quantity, subtotal, created_at 
-		FROM order_items WHERE order_no = ? ORDER BY item_no ASC`, orderNo)
-	if err != nil {
-		logger.Printf("[ERROR] 明細取得失敗: %v", err)
-		respondWithError(w, http.StatusInternalServerError, "Database error")
-		return
-	}
-	defer rows.Close()
-
-	var items []OrderItem
-	for rows.Next() {
-		var item OrderItem
-		var createdAtStr string
-		err := rows.Scan(&item.ID, &item.OrderNo, &item.TerminalNo, &item.Status, &item.ItemNo, &item.MenuName, &item.UnitPrice, &item.Quantity, &item.Subtotal, &createdAtStr)
-		if err != nil {
-			logger.Printf("[ERROR] スキャン失敗: %v", err)
-			respondWithError(w, http.StatusInternalServerError, "Data mapping error")
-			return
-		}
-		items = append(items, item)
-	}
-
-	if len(items) == 0 {
-		respondWithError(w, http.StatusNotFound, "Order not found")
-		return
-	}
-
-	respondWithJSON(w, http.StatusOK, items)
-}
-
-// PUT /api/orders/{orderNo}/status
-func handleUpdateOrderStatus(w http.ResponseWriter, r *http.Request) {
-	orderNo := r.PathValue("orderNo")
-	var req map[string]string
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondWithError(w, http.StatusBadRequest, "Invalid JSON")
-		return
-	}
-	newStatus := req["orderStatus"]
-	logger.Printf("[API_IN] PUT /api/orders/%s/status - TargetStatus: %s", orderNo, newStatus)
-
-	if newStatus != StatusReceived && newStatus != StatusCooked && newStatus != StatusDelivered {
-		respondWithError(w, http.StatusBadRequest, "Invalid status value")
-		return
-	}
-
-	affected, err := updateStatus(orderNo, newStatus)
-	if err != nil {
-		logger.Printf("[ERROR] ステータス更新失敗: %v", err)
-		respondWithError(w, http.StatusInternalServerError, "Database update error")
-		return
-	}
-
-	if affected == 0 {
-		respondWithError(w, http.StatusNotFound, "Order not found")
-		return
-	}
-
-	respondWithJSON(w, http.StatusOK, map[string]string{"result": "OK", "message": "Status updated successfully"})
-}
-
-// 3.2 フロント掲示板機能 (POST /api/board)
-type BoardRequest struct {
-	TerminalNo  string `json:"terminalNo"`
-	MessageType string `json:"messageType"`
-	OrderNo     string `json:"orderNo,omitempty"`
-}
-
-func handleBoard(w http.ResponseWriter, r *http.Request) {
-	var req BoardRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondWithError(w, http.StatusBadRequest, "Invalid JSON")
-		return
-	}
-	logger.Printf("[API_IN] POST /api/board - OrderNo: %s, MessageType: %s", req.OrderNo, req.MessageType)
-
-	if req.MessageType != "BOARD_REQUEST" {
-		respondWithError(w, http.StatusBadRequest, "Invalid messageType")
-		return
-	}
-
-	// orderNoの指定がある場合は「受け渡し済み」にステータスを変更
-	if strings.TrimSpace(req.OrderNo) != "" {
-		_, err := updateStatus(req.OrderNo, StatusDelivered)
-		if err != nil {
-			logger.Printf("[ERROR] 掲示板経由のステータス更新失敗: %v", err)
-			respondWithError(w, http.StatusInternalServerError, "Database update error")
-			return
-		}
-	}
-
-	// 最新の掲示板用情報を抽出して返却
-	cooking, err := getOrderNosByStatus(StatusReceived)
-	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Fetch failure")
-		return
-	}
-	ready, err := getOrderNosByStatus(StatusCooked)
-	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Fetch failure")
-		return
-	}
-
-	resp := map[string]interface{}{
-		"result":         "OK",
-		"cookingOrders":  cooking,
-		"readyOrders":    ready,
-	}
-	respondWithJSON(w, http.StatusOK, resp)
-}
-
-// 3.3 厨房機能 (POST /api/kitchen)
-type KitchenRequest struct {
-	TerminalNo  string `json:"terminalNo,omitempty"`
-	MessageType string `json:"messageType"`
-	OrderNo     string `json:"orderNo,omitempty"`
-}
-
-type KitchenOrderSummary struct {
-	OrderNo string            `json:"orderNo"`
-	Items   []KitchenItemInfo `json:"items"`
-}
-
-type KitchenItemInfo struct {
+type OrderItemResponse struct {
 	MenuName string `json:"menuName"`
 	Quantity int    `json:"quantity"`
 }
 
-func handleKitchen(w http.ResponseWriter, r *http.Request) {
-	var req KitchenRequest
+type KitchenOrderResponse struct {
+	OrderNo string              `json:"orderNo"`
+	Items   []OrderItemResponse `json:"items"`
+}
+
+type KitchenResponse struct {
+	Result string                 `json:"result"`
+	Orders []KitchenOrderResponse `json:"orders"`
+}
+
+type BoardKitchenRequest struct {
+	MessageType string `json:"messageType"`
+	TerminalNo  string `json:"terminalNo"`
+	OrderNo     string `json:"orderNo,omitempty"`
+}
+
+func handleOrdersPost(w http.ResponseWriter, r *http.Request) {
+	var req OrderConfirmRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondWithError(w, http.StatusBadRequest, "Invalid JSON")
-		return
-	}
-	logger.Printf("[API_IN] POST /api/kitchen - OrderNo: %s, MessageType: %s", req.OrderNo, req.MessageType)
-
-	if req.MessageType != "KITCHEN_REQUEST" {
-		respondWithError(w, http.StatusBadRequest, "Invalid messageType")
+		respondError(w, "Invalid JSON structure")
 		return
 	}
 
-	// orderNoの指定がある場合は「調理済み」にステータスを変更
-	if strings.TrimSpace(req.OrderNo) != "" {
-		_, err := updateStatus(req.OrderNo, StatusCooked)
-		if err != nil {
-			logger.Printf("[ERROR] 厨房経由のステータス更新失敗: %v", err)
-			respondWithError(w, http.StatusInternalServerError, "Database update error")
+	reqBytes, _ := json.Marshal(req)
+	Logger.Printf("[API入電文 POST /api/orders] %s", string(reqBytes))
+
+	// バリデーションチェック
+	if req.TerminalNo == "" || req.MessageType != "ORDER_CONFIRM" || req.TotalAmount < 1 {
+		respondError(w, "Validation Error: Check terminalNo, messageType, or totalAmount")
+		return
+	}
+	if len(req.Items) < 1 || len(req.Items) > 5 {
+		respondError(w, "Validation Error: items list length must be 1 to 5")
+		return
+	}
+
+	calcTotal := 0
+	menuSet := make(map[string]bool)
+	for _, item := range req.Items {
+		if item.MenuName == "" || item.UnitPrice < 1 || item.Quantity < 1 || item.Quantity > 5 {
+			respondError(w, "Validation Error: Invalid item specifications")
 			return
 		}
+		if menuSet[item.MenuName] {
+			respondError(w, "Validation Error: Duplicate menuName forbidden in single order")
+			return
+		}
+		menuSet[item.MenuName] = true
+
+		calcSubtotal := item.UnitPrice * item.Quantity
+		if item.Subtotal != calcSubtotal {
+			respondError(w, "Validation Error: Calculated subtotal mismatch")
+			return
+		}
+		calcTotal += calcSubtotal
 	}
 
-	// 最新の未調理一覧（オーダ受信済み）をマッピング
-	rawOrders, err := getOrdersWithFilter(StatusReceived)
-	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Fetch failure")
+	if req.TotalAmount != calcTotal {
+		respondError(w, "Validation Error: totalAmount mismatch with summation of subtotals")
 		return
 	}
 
-	kitchenOrders := []KitchenOrderSummary{}
-	for _, ro := range rawOrders {
-		var kItems []KitchenItemInfo
-		for _, item := range ro.Items {
-			kItems = append(kItems, KitchenItemInfo{
-				MenuName: item.MenuName,
-				Quantity: item.Quantity,
-			})
+	orderNo, err := createOrderInTx(req.TerminalNo, req.Items)
+	if err != nil {
+		respondError(w, "Internal Database Transaction Failure: "+err.Error())
+		return
+	}
+
+	res := GenericResponse{
+		Result:  "OK",
+		OrderNo: orderNo,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	resBytes, _ := json.Marshal(res)
+	Logger.Printf("[API出電文 POST /api/orders] %s", string(resBytes))
+	w.Write(resBytes)
+}
+
+func handleOrdersGet(w http.ResponseWriter, r *http.Request) {
+	statusFilter := r.URL.Query().Get("status")
+	Logger.Printf("[API入電文 GET /api/orders?status=%s]", statusFilter)
+
+	query := "SELECT order_no, order_status FROM order_items"
+	var args []interface{}
+	if statusFilter != "" {
+		query += " WHERE order_status = ?"
+		args = append(args, statusFilter)
+	}
+	query += " GROUP BY order_no ORDER BY id ASC"
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type OrderSummary struct {
+		OrderNo     string `json:"orderNo"`
+		OrderStatus string `json:"orderStatus"`
+	}
+	orders := []OrderSummary{}
+	for rows.Next() {
+		var o OrderSummary
+		if err := rows.Scan(&o.OrderNo, &o.OrderStatus); err == nil {
+			orders = append(orders, o)
 		}
-		kitchenOrders = append(kitchenOrders, KitchenOrderSummary{
-			OrderNo: ro.OrderNo,
-			Items:   kItems,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(orders)
+}
+
+func handleOrdersGetByNo(w http.ResponseWriter, r *http.Request) {
+	orderNo := r.PathValue("orderNo")
+	Logger.Printf("[API入電文 GET /api/orders/%s]", orderNo)
+
+	rows, err := db.Query("SELECT menu_name, quantity FROM order_items WHERE order_no = ?", orderNo)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	items := []OrderItemResponse{}
+	for rows.Next() {
+		var item OrderItemResponse
+		if err := rows.Scan(&item.MenuName, &item.Quantity); err == nil {
+			items = append(items, item)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(items)
+}
+
+func handleOrdersStatusPut(w http.ResponseWriter, r *http.Request) {
+	orderNo := r.PathValue("orderNo")
+	var body struct {
+		OrderStatus string `json:"orderStatus"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	Logger.Printf("[API入電文 PUT /api/orders/%s/status] status: %s", orderNo, body.OrderStatus)
+
+	_, err := db.Exec("UPDATE order_items SET order_status = ? WHERE order_no = ?", body.OrderStatus, orderNo)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	Logger.Printf("[DB更新内容] OrderNo: %s status updated to %s", orderNo, body.OrderStatus)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"result":"OK"}`))
+}
+
+func handleBoardPost(w http.ResponseWriter, r *http.Request) {
+	var req BoardKitchenRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	reqBytes, _ := json.Marshal(req)
+	Logger.Printf("[API入電文 POST /api/board] %s", string(reqBytes))
+
+	if req.MessageType != "BOARD_REQUEST" {
+		respondError(w, "Validation Error: messageType must be BOARD_REQUEST")
+		return
+	}
+
+	if req.OrderNo != "" {
+		_, err := db.Exec("UPDATE order_items SET order_status = '受け渡し済み' WHERE order_no = ?", req.OrderNo)
+		if err != nil {
+			respondError(w, "Failed to update status to 受け渡し済み")
+			return
+		}
+		Logger.Printf("[DB更新内容] OrderNo: %s status updated to 受け渡し済み", req.OrderNo)
+	}
+
+	cookingRows, _ := db.Query("SELECT DISTINCT order_no FROM order_items WHERE order_status = 'オーダ受信済み' ORDER BY id ASC")
+	cookingOrders := []string{}
+	for cookingRows.Next() {
+		var no string
+		if err := cookingRows.Scan(&no); err == nil {
+			cookingOrders = append(cookingOrders, no)
+		}
+	}
+	cookingRows.Close()
+
+	readyRows, _ := db.Query("SELECT DISTINCT order_no FROM order_items WHERE order_status = '調理済み' ORDER BY id ASC")
+	readyOrders := []string{}
+	for readyRows.Next() {
+		var no string
+		if err := readyRows.Scan(&no); err == nil {
+			readyOrders = append(readyOrders, no)
+		}
+	}
+	readyRows.Close()
+
+	res := GenericResponse{
+		Result:        "OK",
+		CookingOrders: cookingOrders,
+		ReadyOrders:   readyOrders,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	resBytes, _ := json.Marshal(res)
+	Logger.Printf("[API出電文 POST /api/board] %s", string(resBytes))
+	w.Write(resBytes)
+}
+
+func handleKitchenPost(w http.ResponseWriter, r *http.Request) {
+	var req BoardKitchenRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	reqBytes, _ := json.Marshal(req)
+	Logger.Printf("[API入電文 POST /api/kitchen] %s", string(reqBytes))
+
+	if req.MessageType != "KITCHEN_REQUEST" {
+		respondError(w, "Validation Error: messageType must be KITCHEN_REQUEST")
+		return
+	}
+
+	if req.OrderNo != "" {
+		_, err := db.Exec("UPDATE order_items SET order_status = '調理済み' WHERE order_no = ?", req.OrderNo)
+		if err != nil {
+			respondError(w, "Failed to update status to 調理済み")
+			return
+		}
+		Logger.Printf("[DB更新内容] OrderNo: %s status updated to 調理済み", req.OrderNo)
+	}
+
+	rows, err := db.Query("SELECT order_no, menu_name, quantity FROM order_items WHERE order_status = 'オーダ受信済み' ORDER BY id ASC")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	orderMap := make(map[string][]OrderItemResponse)
+	orderOrder := []string{}
+
+	for rows.Next() {
+		var orderNo, menuName string
+		var qty int
+		if err := rows.Scan(&orderNo, &menuName, &qty); err == nil {
+			if _, exists := orderMap[orderNo]; !exists {
+				orderOrder = append(orderOrder, orderNo)
+			}
+			orderMap[orderNo] = append(orderMap[orderNo], OrderItemResponse{MenuName: menuName, Quantity: qty})
+		}
+	}
+
+	ordersRes := []KitchenOrderResponse{}
+	for _, no := range orderOrder {
+		ordersRes = append(ordersRes, KitchenOrderResponse{
+			OrderNo: no,
+			Items:   orderMap[no],
 		})
 	}
 
-	resp := map[string]interface{}{
-		"result": "OK",
-		"orders": kitchenOrders,
+	res := KitchenResponse{
+		Result: "OK",
+		Orders: ordersRes,
 	}
-	respondWithJSON(w, http.StatusOK, resp)
+
+	w.Header().Set("Content-Type", "application/json")
+	resBytes, _ := json.Marshal(res)
+	Logger.Printf("[API出電文 POST /api/kitchen] %s", string(resBytes))
+	w.Write(resBytes)
+}
+
+func respondError(w http.ResponseWriter, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	res, _ := json.Marshal(map[string]string{"result": "NG", "message": msg})
+	Logger.Printf("[API出電文 エラーレスポンス] %s", string(res))
+	w.Write(res)
 }
