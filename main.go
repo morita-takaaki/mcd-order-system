@@ -42,6 +42,12 @@ func main() {
 	mux.HandleFunc("POST /api/board", handleBoardPost)
 	mux.HandleFunc("POST /api/kitchen", handleKitchenPost)
 
+	// AWS/ロードバランサー用ヘルスチェックパスの追加
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
+
 	// グローバルCORSミドルウェアの適用
 	corsHandler := enableCORS(mux)
 
