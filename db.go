@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"log"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -10,20 +11,21 @@ import (
 
 var db *sql.DB
 
-func InitDB() {
+func initDB() {
 	dbPath := "order.db"
-	var err error
-
-	// 同時書き込み対策として busy_timeout=5000 を設定
+	
+	// SQLite接続文字列の設定
 	dsn := fmt.Sprintf("%s?_busy_timeout=5000", dbPath)
+	var err error
 	db, err = sql.Open("sqlite3", dsn)
 	if err != nil {
-		Logger.Fatalf("Failed to open database: %v", err)
+		log.Fatalf("DB接続失敗: %v", err)
 	}
 
-	// 同時書き込み競合を完全に回避するため、最大接続数を1に制限
+	// 同時書き込み対策の設定
 	db.SetMaxOpenConns(1)
 
+	// テーブル作成
 	schema := `
 	CREATE TABLE IF NOT EXISTS order_items (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,61 +41,153 @@ func InitDB() {
 	);`
 
 	if _, err := db.Exec(schema); err != nil {
-		Logger.Fatalf("Failed to create tables: %v", err)
+		log.Fatalf("テーブル作成失敗: %v", err)
 	}
 }
 
-func CloseDB() {
-	if db != nil {
-		db.Close()
-	}
-}
-
-// 採番処理と注文データ登録を同一トランザクション内でカプセル化（重複防止）
-func createOrderInTx(terminalNo string, items []OrderItemInput) (string, error) {
-	tx, err := db.Begin()
+// 注文番号の生成（同日内のユニーク番号 YYMMDDNNNN）
+func generateOrderNo(tx *sql.Tx) (string, error) {
+	today := time.Now().Format("060102")
+	var count int
+	// 本日登録された一意な注文番号の数をカウント
+	query := "SELECT COUNT(DISTINCT order_no) FROM order_items WHERE order_no LIKE ?"
+	err := tx.QueryRow(query, today+"%").Scan(&count)
 	if err != nil {
 		return "", err
 	}
+	return fmt.Sprintf("%s%04d", today, count+1), nil
+}
+
+// 注文の保存
+func insertOrder(req OrderRequest) (string, []LogOrderItem, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return "", nil, err
+	}
 	defer tx.Rollback()
 
-	today := time.Now().Format("0102") // MMDD形式
-	prefix := today + "-"
-
-	// 本日の最終オーダー番号を取得
-	var lastOrderNo string
-	err = tx.QueryRow(`
-		SELECT order_no FROM order_items 
-		WHERE order_no LIKE ?1 
-		ORDER BY id DESC LIMIT 1`, prefix+"%").Scan(&lastOrderNo)
-
-	nextSeq := 1
-	if err == nil && len(lastOrderNo) == 8 {
-		var seq int
-		_, errParse := fmt.Sscanf(lastOrderNo[5:], "%d", &seq)
-		if errParse == nil {
-			nextSeq = seq + 1
-		}
+	orderNo, err := generateOrderNo(tx)
+	if err != nil {
+		return "", nil, err
 	}
 
-	orderNo := fmt.Sprintf("%s%03d", prefix, nextSeq)
-	status := "オーダ受信済み"
+	var loggedItems []LogOrderItem
 
-	for i, item := range items {
-		subtotal := item.UnitPrice * item.Quantity
-		_, err := tx.Exec(`
-			INSERT INTO order_items (order_no, terminal_no, order_status, item_no, menu_name, unit_price, quantity, subtotal)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			orderNo, terminalNo, status, i+1, item.MenuName, item.UnitPrice, item.Quantity, subtotal)
+	for i, item := range req.Items {
+		itemNo := i + 1
+		query := `
+		INSERT INTO order_items (order_no, terminal_no, order_status, item_no, menu_name, unit_price, quantity, subtotal)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+		
+		_, err := tx.Exec(query, orderNo, req.TerminalNo, "オーダ受信済み", itemNo, item.MenuName, item.UnitPrice, item.Quantity, item.Subtotal)
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
+
+		loggedItems = append(loggedItems, LogOrderItem{
+			OrderNo:     orderNo,
+			TerminalNo:  req.TerminalNo,
+			OrderStatus: "オーダ受信済み",
+			ItemNo:      itemNo,
+			MenuName:    item.MenuName,
+			UnitPrice:   item.UnitPrice,
+			Quantity:    item.Quantity,
+			Subtotal:    item.Subtotal,
+		})
 	}
 
 	if err := tx.Commit(); err != nil {
-		return "", err
+		return "", nil, err
 	}
 
-	Logger.Printf("[DB登録内容] OrderNo: %s, Items Total: %d レコード挿入完了", orderNo, len(items))
-	return orderNo, nil
+	return orderNo, loggedItems, nil
+}
+
+// 厨房用注文一覧（オーダ受信済み）の取得
+func getKitchenOrders() ([]KitchenOrder, error) {
+	query := `
+	SELECT order_no, menu_name, quantity 
+	FROM order_items 
+	WHERE order_status = 'オーダ受信済み'
+	ORDER BY id ASC`
+
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	orderMap := make(map[string][]KitchenOrderItem)
+	var orderKeys []string // 順序維持用
+
+	for rows.Next() {
+		var oNo, mName string
+		var qty int
+		if err := rows.Scan(&oNo, &mName, &qty); err != nil {
+			return nil, err
+		}
+
+		item := KitchenOrderItem{MenuName: mName, Quantity: qty}
+		if _, exists := orderMap[oNo]; !exists {
+			orderKeys = append(orderKeys, oNo)
+		}
+		orderMap[oNo] = append(orderMap[oNo], item)
+	}
+
+	orders := []KitchenOrder{}
+	for _, k := range orderKeys {
+		orders = append(orders, KitchenOrder{
+			OrderNo: k,
+			Items:   orderMap[k],
+		})
+	}
+
+	return orders, nil
+}
+
+// 厨房注文ステータス更新（オーダ受信済み -> 調理済み）
+func updateKitchenStatus(orderNo string) (int64, error) {
+	query := "UPDATE order_items SET order_status = '調理済み' WHERE order_no = ? AND order_status = 'オーダ受信済み'"
+	res, err := db.Exec(query, orderNo)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// 掲示板用情報（調理中・受け渡し可能）の取得
+func getBoardOrders() ([]string, []string, error) {
+	query := "SELECT DISTINCT order_no, order_status FROM order_items WHERE order_status IN ('オーダ受信済み', '調理済み') ORDER BY id ASC"
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+
+	var cookingOrders []string
+	var readyOrders []string
+
+	for rows.Next() {
+		var oNo, status string
+		if err := rows.Scan(&oNo, &status); err != nil {
+			return nil, nil, err
+		}
+		if status == "オーダ受信済み" {
+			cookingOrders = append(cookingOrders, oNo)
+		} else if status == "調理済み" {
+			readyOrders = append(readyOrders, oNo)
+		}
+	}
+
+	return cookingOrders, readyOrders, nil
+}
+
+// 掲示板注文ステータス更新（調理済み -> 受け渡し済み）
+func updateBoardStatus(orderNo string) (int64, error) {
+	query := "UPDATE order_items SET order_status = '受け渡し済み' WHERE order_no = ? AND order_status = '調理済み'"
+	res, err := db.Exec(query, orderNo)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
